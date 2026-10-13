@@ -1,0 +1,6 @@
+@LogLens.Api_HostAddress = http://localhost:5167
+
+GET {{LogLens.Api_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

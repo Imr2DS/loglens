@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/LogLens.Domain/LogLens.Domain.csproj" />
+  </Folder>
+  <Project Path="src/LogLens.Api/LogLens.Api.csproj" />
+  <Project Path="src/LogLens.Application/LogLens.Application.csproj" />
+  <Project Path="src/LogLens.Demo/LogLens.Demo.csproj" />
+  <Project Path="src/LogLens.Infrastructure/LogLens.Infrastructure.csproj" />
+  <Project Path="src/LogLens.Sdk/LogLens.Sdk.csproj" />
+  <Project Path="src/LogLens.Web/LogLens.Web.csproj" />
+  <Project Path="tests/LogLens.tests/LogLens.Tests.csproj" />
+</Solution>
