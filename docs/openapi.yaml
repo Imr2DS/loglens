@@ -1,0 +1,925 @@
+openapi: 3.0.3
+info:
+  title: LogLens API
+  version: 1.0.0
+  description: |
+    API de la plateforme **LogLens** : ingestion de logs d'applications .NET,
+    consultation des problèmes (issues) regroupés par empreinte et expliqués
+    en langage humain, et administration (projets, clés API, règles de masquage).
+
+    ### Authentification
+    - **Ingestion** (`POST /api/logs`) : en-tête `X-Api-Key` (clé propre à chaque projet, stockée hachée).
+    - **Consultation et administration** : session utilisateur ASP.NET Core Identity (cookie).
+
+    ### Traitement asynchrone
+    L'ingestion répond `202 Accepted` après persistance ; le masquage, la
+    normalisation, le fingerprint, l'analyse et l'explication se font en différé
+    (objectif : < 200 ms de réponse, >= 100 logs/s).
+
+    ### Erreurs
+    Toutes les erreurs suivent le format `application/problem+json` (RFC 7807).
+  license:
+    name: MIT
+servers:
+  - url: http://localhost:8081
+    description: Local (docker compose)
+tags:
+  - name: Ingestion
+    description: Réception des logs envoyés par les applications clientes (SDK ou HTTP).
+  - name: Issues
+    description: Problèmes regroupés par empreinte, avec explication.
+  - name: Projects
+    description: Gestion des projets et de leurs clés API (administrateur).
+  - name: MaskingRules
+    description: Règles de masquage personnalisées par projet (administrateur).
+  - name: Health
+    description: Supervision.
+
+paths:
+  /api/logs:
+    post:
+      tags: [Ingestion]
+      operationId: ingestLogs
+      summary: Envoyer un log ou un lot de logs
+      description: |
+        Accepte soit un seul événement, soit un tableau d'événements (lot, 1 à 500).
+        Les événements sont persistés avant traitement ; aucun log n'est perdu en cas de
+        redémarrage du worker.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/LogEventInput'
+                - type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    $ref: '#/components/schemas/LogEventInput'
+            examples:
+              single:
+                summary: Un seul événement
+                value:
+                  timestamp: '2026-10-13T09:15:42Z'
+                  level: Error
+                  message: Checkout failed
+                  exception: 'System.InvalidOperationException: Sequence contains no elements'
+                  stackTrace: |-
+                    at System.Linq.Enumerable.First[TSource](IEnumerable`1 source)
+                    at ShopApp.Services.CartService.GetCheapestItem(Cart cart) in CartService.cs:line 42
+                    at ShopApp.Controllers.CartController.Checkout() in CartController.cs:line 18
+                  appVersion: 1.4.2
+                  environment: Production
+                  traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+      responses:
+        '202':
+          description: Événements acceptés et persistés, traitement différé.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          description: Corps de requête trop volumineux.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/issues:
+    get:
+      tags: [Issues]
+      operationId: listIssues
+      summary: Lister les problèmes
+      description: Liste paginée, triable et filtrable des problèmes.
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: projectId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: environment
+          in: query
+          schema: { type: string }
+        - name: version
+          in: query
+          description: Version de l'application où le problème a été observé.
+          schema: { type: string }
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/IssueStatus'
+        - name: search
+          in: query
+          description: Recherche plein texte dans le titre.
+          schema: { type: string, maxLength: 200 }
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [frequency, recency, severity]
+            default: recency
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Page de problèmes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssuePage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/issues/{issueId}:
+    parameters:
+      - $ref: '#/components/parameters/IssueId'
+    get:
+      tags: [Issues]
+      operationId: getIssue
+      summary: Détail d'un problème
+      description: Problème avec son explication, son origine dans le code et ses statistiques.
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: Détail du problème.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/issues/{issueId}/status:
+    parameters:
+      - $ref: '#/components/parameters/IssueId'
+    put:
+      tags: [Issues]
+      operationId: updateIssueStatus
+      summary: Changer le statut d'un problème
+      description: |
+        Statuts : `New`, `InProgress`, `Resolved`, `Ignored`. Un problème `Resolved`
+        est rouvert automatiquement (`New`) si l'erreur réapparaît.
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  $ref: '#/components/schemas/IssueStatus'
+      responses:
+        '200':
+          description: Statut mis à jour.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueSummary'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/issues/{issueId}/occurrences:
+    parameters:
+      - $ref: '#/components/parameters/IssueId'
+    get:
+      tags: [Issues]
+      operationId: getIssueOccurrences
+      summary: Occurrences dans le temps (graphique)
+      description: Nombre d'occurrences par intervalle, pour le graphique de la page de détail.
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+          description: Début de la période (défaut = 7 jours avant `to`).
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+          description: Fin de la période (défaut = maintenant).
+        - name: interval
+          in: query
+          schema:
+            type: string
+            enum: [hour, day]
+            default: hour
+      responses:
+        '200':
+          description: Série temporelle d'occurrences.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OccurrenceSeries'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/issues/{issueId}/timeline:
+    parameters:
+      - $ref: '#/components/parameters/IssueId'
+    get:
+      tags: [Issues]
+      operationId: getIssueTimeline
+      summary: Chronologie des logs liés (corrélation par traceId)
+      description: |
+        Retourne les logs partageant le même `traceId` qu'une occurrence du problème,
+        triés par date. Sans `traceId`, la dernière occurrence est utilisée.
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: traceId
+          in: query
+          schema: { type: string, maxLength: 128 }
+      responses:
+        '200':
+          description: Chronologie.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Timeline'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/projects:
+    get:
+      tags: [Projects]
+      operationId: listProjects
+      summary: Lister les projets
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: Liste des projets.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Project'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Projects]
+      operationId: createProject
+      summary: Créer un projet
+      description: Crée le projet et génère sa clé API. **La clé n'est affichée qu'une seule fois.**
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectInput'
+      responses:
+        '201':
+          description: Projet créé.
+          headers:
+            Location:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectCreated'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/projects/{projectId}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [Projects]
+      operationId: getProject
+      summary: Détail d'un projet
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: Projet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Projects]
+      operationId: updateProject
+      summary: Modifier un projet
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectInput'
+      responses:
+        '200':
+          description: Projet mis à jour.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    delete:
+      tags: [Projects]
+      operationId: deleteProject
+      summary: Supprimer un projet et ses données
+      security:
+        - cookieAuth: []
+      responses:
+        '204':
+          description: Projet supprimé.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/projects/{projectId}/api-key:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    post:
+      tags: [Projects]
+      operationId: regenerateApiKey
+      summary: Régénérer la clé API
+      description: |
+        Invalide l'ancienne clé et en génère une nouvelle. **La nouvelle clé n'est
+        retournée qu'une seule fois** ; seule son empreinte est conservée.
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: Nouvelle clé API.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeyCreated'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/projects/{projectId}/masking-rules:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [MaskingRules]
+      operationId: listMaskingRules
+      summary: Lister les règles de masquage du projet
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: Règles personnalisées (les règles intégrées ne sont pas listées).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MaskingRule'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [MaskingRules]
+      operationId: createMaskingRule
+      summary: Ajouter une règle de masquage
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MaskingRuleInput'
+      responses:
+        '201':
+          description: Règle créée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaskingRule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/projects/{projectId}/masking-rules/{ruleId}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - name: ruleId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    put:
+      tags: [MaskingRules]
+      operationId: updateMaskingRule
+      summary: Modifier une règle de masquage
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MaskingRuleInput'
+      responses:
+        '200':
+          description: Règle mise à jour.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaskingRule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [MaskingRules]
+      operationId: deleteMaskingRule
+      summary: Supprimer une règle de masquage
+      security:
+        - cookieAuth: []
+      responses:
+        '204':
+          description: Règle supprimée.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /health:
+    get:
+      tags: [Health]
+      operationId: getHealth
+      summary: État de santé de la plateforme
+      description: Vérifie l'API, la base de données et (optionnellement) le LLM.
+      security: []
+      responses:
+        '200':
+          description: Plateforme opérationnelle.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: Au moins une dépendance critique est indisponible.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+      description: Clé API du projet, générée à la création du projet.
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: .AspNetCore.Identity.Application
+      description: Session ASP.NET Core Identity (connexion via le tableau de bord).
+
+  parameters:
+    IssueId:
+      name: issueId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ProjectId:
+      name: projectId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: pageSize
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+
+  responses:
+    BadRequest:
+      description: Requête invalide (validation).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ValidationProblemDetails'
+    Unauthorized:
+      description: Authentification absente ou invalide (clé API ou session).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    Forbidden:
+      description: Rôle administrateur requis.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    NotFound:
+      description: Ressource introuvable.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    Conflict:
+      description: Conflit (par exemple nom de projet déjà utilisé).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    TooManyRequests:
+      description: Limite de débit du projet dépassée.
+      headers:
+        Retry-After:
+          description: Délai d'attente conseillé, en secondes.
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+  schemas:
+    LogLevel:
+      type: string
+      enum: [Verbose, Debug, Information, Warning, Error, Fatal]
+
+    IssueStatus:
+      type: string
+      enum: [New, InProgress, Resolved, Ignored]
+
+    ExplanationSource:
+      type: string
+      enum: [Rule, Llm]
+
+    Confidence:
+      type: string
+      enum: [High, Medium, Low]
+
+    LogEventInput:
+      type: object
+      required: [timestamp, level, message]
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        level:
+          $ref: '#/components/schemas/LogLevel'
+        message:
+          type: string
+          maxLength: 8192
+        exception:
+          type: string
+          nullable: true
+          maxLength: 2048
+          description: Type et message de l'exception (première ligne).
+        stackTrace:
+          type: string
+          nullable: true
+          maxLength: 65536
+        appVersion:
+          type: string
+          nullable: true
+          maxLength: 64
+        environment:
+          type: string
+          nullable: true
+          maxLength: 64
+          example: Production
+        traceId:
+          type: string
+          nullable: true
+          maxLength: 128
+        properties:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Propriétés structurées additionnelles (Serilog).
+
+    IngestionResult:
+      type: object
+      required: [accepted]
+      properties:
+        accepted:
+          type: integer
+          description: Nombre d'événements acceptés.
+          example: 1
+
+    Issue:
+      type: object
+      description: Champs communs d'un problème.
+      required: [id, projectId, title, status, firstSeen, lastSeen, occurrenceCount]
+      properties:
+        id: { type: string, format: uuid }
+        projectId: { type: string, format: uuid }
+        title: { type: string, example: 'InvalidOperationException dans CartService.GetCheapestItem' }
+        status:
+          $ref: '#/components/schemas/IssueStatus'
+        level:
+          $ref: '#/components/schemas/LogLevel'
+        firstSeen: { type: string, format: date-time }
+        lastSeen: { type: string, format: date-time }
+        occurrenceCount: { type: integer, format: int64, example: 23 }
+        firstSeenVersion:
+          type: string
+          nullable: true
+          description: Version de l'application où le problème est apparu.
+          example: 1.4.2
+
+    IssueSummary:
+      allOf:
+        - $ref: '#/components/schemas/Issue'
+        - type: object
+          properties:
+            environments:
+              type: array
+              items: { type: string }
+            hasExplanation: { type: boolean }
+
+    IssuePage:
+      type: object
+      required: [items, page, pageSize, totalCount]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/IssueSummary'
+        page: { type: integer }
+        pageSize: { type: integer }
+        totalCount: { type: integer, format: int64 }
+
+    IssueDetail:
+      allOf:
+        - $ref: '#/components/schemas/Issue'
+        - type: object
+          properties:
+            fingerprint: { type: string, example: 'a3f9c2e17b0d44aa' }
+            exceptionType: { type: string, example: System.InvalidOperationException }
+            origin:
+              $ref: '#/components/schemas/CodeLocation'
+            explanation:
+              $ref: '#/components/schemas/Explanation'
+            frames:
+              type: array
+              description: Frames de la stack trace, la première frame applicative étant marquée.
+              items:
+                $ref: '#/components/schemas/StackFrame'
+            sampleTraceId:
+              type: string
+              nullable: true
+              description: Identifiant de trace d'une occurrence récente (pour la chronologie).
+
+    CodeLocation:
+      type: object
+      nullable: true
+      description: Première frame du code applicatif (origine probable).
+      properties:
+        method: { type: string, example: ShopApp.Services.CartService.GetCheapestItem }
+        file: { type: string, nullable: true, example: CartService.cs }
+        line: { type: integer, nullable: true, example: 42 }
+
+    StackFrame:
+      type: object
+      required: [method, isApplicationCode]
+      properties:
+        method: { type: string }
+        file: { type: string, nullable: true }
+        line: { type: integer, nullable: true }
+        isApplicationCode: { type: boolean }
+
+    Explanation:
+      type: object
+      nullable: true
+      required: [summary, source, confidence]
+      properties:
+        summary:
+          type: string
+          description: Ce qui s'est passé, en langage clair.
+        cause:
+          type: string
+          nullable: true
+          description: Pourquoi cela s'est produit.
+        suggestedFix:
+          type: string
+          nullable: true
+          description: Piste de correction.
+        observedFacts:
+          type: array
+          items: { type: string }
+          description: Faits observés dans les logs.
+        hypotheses:
+          type: array
+          items: { type: string }
+          description: Hypothèses (non vérifiées).
+        source:
+          $ref: '#/components/schemas/ExplanationSource'
+        ruleId:
+          type: string
+          nullable: true
+          description: Identifiant de la règle utilisée (source = Rule).
+        confidence:
+          $ref: '#/components/schemas/Confidence'
+        language:
+          type: string
+          enum: [fr, en]
+        generatedAt: { type: string, format: date-time }
+
+    OccurrenceSeries:
+      type: object
+      required: [interval, points]
+      properties:
+        interval:
+          type: string
+          enum: [hour, day]
+        points:
+          type: array
+          items:
+            type: object
+            required: [timestamp, count]
+            properties:
+              timestamp: { type: string, format: date-time }
+              count: { type: integer, format: int64 }
+
+    Timeline:
+      type: object
+      required: [traceId, events]
+      properties:
+        traceId: { type: string, nullable: true }
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimelineEvent'
+
+    TimelineEvent:
+      type: object
+      required: [timestamp, level, message]
+      properties:
+        timestamp: { type: string, format: date-time }
+        level:
+          $ref: '#/components/schemas/LogLevel'
+        message:
+          type: string
+          description: Message déjà masqué.
+        isIssueOccurrence:
+          type: boolean
+          description: Vrai pour l'événement qui correspond au problème.
+
+    Project:
+      type: object
+      required: [id, name, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, example: ShopApp }
+        description: { type: string, nullable: true }
+        apiKeyPrefix:
+          type: string
+          description: Début de la clé (non secret) pour l'identifier dans l'interface.
+          example: ll_a1b2
+        rateLimitPerMinute: { type: integer, example: 6000 }
+        createdAt: { type: string, format: date-time }
+
+    ProjectInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        description: { type: string, nullable: true, maxLength: 500 }
+        rateLimitPerMinute: { type: integer, minimum: 1 }
+
+    ProjectCreated:
+      allOf:
+        - $ref: '#/components/schemas/Project'
+        - type: object
+          required: [apiKey]
+          properties:
+            apiKey:
+              type: string
+              description: Clé en clair, **affichée une seule fois**.
+              example: ll_a1b2c3d4e5f6...
+
+    ApiKeyCreated:
+      type: object
+      required: [apiKey, apiKeyPrefix]
+      properties:
+        apiKey:
+          type: string
+          description: Clé en clair, **affichée une seule fois**.
+        apiKeyPrefix: { type: string }
+
+    MaskingRule:
+      type: object
+      required: [id, name, pattern, replacement]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, example: Numéro de contrat }
+        pattern:
+          type: string
+          description: Expression régulière (.NET).
+          example: 'CT-\d{8}'
+        replacement:
+          type: string
+          example: '[CONTRACT]'
+        enabled: { type: boolean, default: true }
+
+    MaskingRuleInput:
+      type: object
+      required: [name, pattern, replacement]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        pattern: { type: string, minLength: 1, maxLength: 500 }
+        replacement: { type: string, minLength: 1, maxLength: 100 }
+        enabled: { type: boolean, default: true }
+
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [Healthy, Degraded, Unhealthy]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [Healthy, Degraded, Unhealthy]
+          example: { database: Healthy, llm: Degraded }
+
+    ProblemDetails:
+      type: object
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+
+    ValidationProblemDetails:
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          properties:
+            errors:
+              type: object
+              additionalProperties:
+                type: array
+                items: { type: string }
